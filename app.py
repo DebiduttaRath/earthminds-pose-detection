@@ -1,6 +1,6 @@
 # estimation_app.py
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from streamlit_webrtc import webrtc_streamer
 import cv2
 import mediapipe as mp
 import pandas as pd
@@ -10,7 +10,25 @@ import tempfile
 import time
 import os
 from collections import deque
+from streamlit.runtime.media_file_storage import MediaFileStorage
+import atexit
 
+# Initialize and clear media files
+def clear_temp_files():
+    try:
+        MediaFileStorage.clear_all()
+    except:
+        pass
+
+atexit.register(clear_temp_files)
+clear_temp_files()
+
+# Suppress MediaPipe/TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+# -------------------------
+# App Configuration
+# -------------------------
 st.set_page_config(layout="wide", page_title="Pose + Segmentation + 3D Export + History")
 st.title("WebRTC / Video Pose Estimation + Segmentation + 3D Export + History Buffer")
 
@@ -88,197 +106,264 @@ def apply_segmentation_mask(frame_bgr, seg_mask, seg_threshold=0.5, alpha=0.7):
     return cv2.addWeighted(frame_bgr, 1.0 - alpha, out, alpha, 0)
 
 # -------------------------
-# Live WebRTC Transformer
+# Video Processor Class
 # -------------------------
-class PoseVideoTransformer(VideoTransformerBase):
+class PoseVideoProcessor:
     def __init__(self):
-        self.pose = mp_pose.Pose(static_image_mode=False,
-                                 model_complexity=model_complexity,
-                                 enable_segmentation=True,
-                                 min_detection_confidence=detection_conf,
-                                 min_tracking_confidence=tracking_conf)
-        self.seg = mp_selfie.SelfieSegmentation(model_selection=1)
+        self.pose = None
+        self.seg = None
+        self.initialize_models()
         self.latest_df = None
         self.history = deque(maxlen=buffer_size)
         self.frame_counter = 0
+        self.last_html_update = 0
+        
+    def initialize_models(self):
+        self.pose = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=model_complexity,
+            enable_segmentation=True,
+            min_detection_confidence=detection_conf,
+            min_tracking_confidence=tracking_conf
+        )
+        self.seg = mp_selfie.SelfieSegmentation(model_selection=1)
 
-    def transform(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        self.frame_counter += 1
-        res_pose = self.pose.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    def recv(self, frame):
+        try:
+            img = frame.to_ndarray(format="bgr24")
+            self.frame_counter += 1
+            
+            # Process pose and segmentation
+            res_pose = self.pose.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            seg_mask = self.seg.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).segmentation_mask if show_seg else None
 
-        seg_mask = None
-        if show_seg:
-            res_seg = self.seg.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            seg_mask = res_seg.segmentation_mask if res_seg else None
+            annotated = img.copy()
+            
+            if res_pose.pose_landmarks:
+                # Draw landmarks
+                mp_drawing.draw_landmarks(
+                    annotated, res_pose.pose_landmarks,
+                    mp_pose.POSE_CONNECTIONS,
+                    landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style()
+                )
+                
+                # Store landmarks
+                df = landmarks_to_dataframe(res_pose.pose_landmarks, frame_index=self.frame_counter)
+                self.latest_df = df.set_index("index")
+                self.history.append(df)
+                
+                # Handle HTML exports (throttled)
+                current_time = time.time()
+                if (save_html_sequence or continuous_html_recording) and (current_time - self.last_html_update > 1.0):
+                    if save_html_sequence:
+                        build_3d_figure(df).write_html(f"pose_frame_{self.frame_counter}.html")
+                    if continuous_html_recording:
+                        combined_df = pd.concat(self.history).reset_index(drop=True)
+                        build_3d_figure(combined_df).write_html("pose_continuous.html")
+                    self.last_html_update = current_time
 
-        annotated = img.copy()
-        if res_pose.pose_landmarks:
-            mp_drawing.draw_landmarks(
-                annotated, res_pose.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style()
-            )
-            df = landmarks_to_dataframe(res_pose.pose_landmarks, frame_index=self.frame_counter).set_index("index")
-            self.latest_df = df
-            self.history.append(df.reset_index())
-            if save_html_sequence:
-                build_3d_figure(df.reset_index()).write_html(f"pose_frame_{self.frame_counter}.html")
+            # Apply segmentation if enabled
+            if show_seg and seg_mask is not None:
+                annotated = apply_segmentation_mask(annotated, seg_mask, seg_threshold=segmentation_conf)
 
-        if show_seg and seg_mask is not None:
-            annotated = apply_segmentation_mask(annotated, seg_mask, seg_threshold=segmentation_conf)
-
-        if continuous_html_recording and self.latest_df is not None:
-            combined_df = pd.concat(self.history).reset_index(drop=True)
-            build_3d_figure(combined_df[combined_df["frame"] == self.frame_counter]
-                            .reset_index(drop=True)).write_html("pose_continuous.html")
-        return annotated
+            return annotated
+            
+        except Exception as e:
+            print(f"Processing error: {str(e)}")
+            return frame.to_ndarray(format="bgr24")
 
     def __del__(self):
-        self.pose.close()
-        self.seg.close()
+        if self.pose:
+            self.pose.close()
+        if self.seg:
+            self.seg.close()
 
 # -------------------------
-# Mode Selection
+# Main App Logic
 # -------------------------
 if video_file:
-    # -------------------------
     # Video file processing mode
-    # -------------------------
-    tfile = tempfile.NamedTemporaryFile(delete=False)
-    tfile.write(video_file.read())
-    cap = cv2.VideoCapture(tfile.name)
+    with tempfile.NamedTemporaryFile(delete=False) as tfile:
+        tfile.write(video_file.read())
+        temp_path = tfile.name
+    
+    try:
+        cap = cv2.VideoCapture(temp_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 0
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps_video = cap.get(cv2.CAP_PROP_FPS) or 0
+        pose = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=model_complexity,
+            enable_segmentation=True,
+            min_detection_confidence=detection_conf,
+            min_tracking_confidence=tracking_conf
+        )
+        seg = mp_selfie.SelfieSegmentation(model_selection=1)
 
-    pose = mp_pose.Pose(static_image_mode=False,
-                        model_complexity=model_complexity,
-                        enable_segmentation=True,
-                        min_detection_confidence=detection_conf,
-                        min_tracking_confidence=tracking_conf)
-    seg = mp_selfie.SelfieSegmentation(model_selection=1)
+        history = []
+        frame_counter = 0
+        stframe = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        st.markdown(f"**Video Info:** {total_frames} frames @ {fps_video:.1f} FPS")
 
-    history = []
-    frame_counter = 0
-    stframe = st.empty()
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    st.markdown(f"**Video Info:** {total_frames} frames @ {fps_video:.1f} FPS")
-
-    show_realtime_3d = st.sidebar.checkbox("Show 3D preview while processing", value=False)
-
-    save_annotated = st.sidebar.checkbox("Save annotated/output video", value=False)
-    annotated_path = None
-    video_writer = None
-    if save_annotated:
-        annotated_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-
-    start_time = time.time()
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_counter += 1
-
-        res_pose = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        res_seg = None
-        if res_pose.pose_landmarks:
-            df = landmarks_to_dataframe(res_pose.pose_landmarks, frame_index=frame_counter).set_index("index")
-            history.append(df.reset_index())
-            if show_realtime_3d and frame_counter % update_3d_every_n_frames == 0:
-                fig = build_3d_figure(df.reset_index())
-                st.plotly_chart(fig, use_container_width=True, height=400)
-
-        if show_seg:
-            res_seg = seg.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        annotated_frame = frame.copy()
-        if res_pose.pose_landmarks:
-            mp_drawing.draw_landmarks(
-                annotated_frame,
-                res_pose.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style()
-            )
-        if show_seg and res_seg and res_seg.segmentation_mask is not None:
-            annotated_frame = apply_segmentation_mask(annotated_frame, res_seg.segmentation_mask, seg_threshold=segmentation_conf)
-
-        if save_annotated and video_writer is None:
-            h, w = annotated_frame.shape[:2]
-            out_fps = fps_video if fps_video and fps_video > 0 else 30.0
+        show_realtime_3d = st.sidebar.checkbox("Show 3D preview while processing", value=False)
+        save_annotated = st.sidebar.checkbox("Save annotated/output video", value=False)
+        
+        # Video writer setup
+        video_writer = None
+        if save_annotated:
+            output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            video_writer = cv2.VideoWriter(annotated_path, fourcc, out_fps, (w, h))
-        if save_annotated and video_writer is not None:
-            video_writer.write(annotated_frame)
 
-        stframe.image(annotated_frame, channels="BGR", caption=f"Frame {frame_counter}")
-        progress_bar.progress(frame_counter / total_frames)
-        elapsed_time = time.time() - start_time
-        status_text.text(f"Processed {frame_counter}/{total_frames} frames | {frame_counter/elapsed_time:.2f} FPS")
+        start_time = time.time()
 
-    cap.release()
-    pose.close()
-    seg.close()
-    if video_writer is not None:
-        video_writer.release()
-    progress_bar.empty()
-    status_text.empty()
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            frame_counter += 1
+            res_pose = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            res_seg = seg.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)) if show_seg else None
 
-    if history:
-        full_history = pd.concat(history).reset_index(drop=True)
-        st.subheader(f"Processed Video ({len(history)} frames)")
-        st.download_button("Download Video Pose CSV",
-                           full_history.to_csv(index=False),
-                           "pose_video_history.csv", "text/csv")
+            # Process landmarks
+            if res_pose.pose_landmarks:
+                df = landmarks_to_dataframe(res_pose.pose_landmarks, frame_index=frame_counter)
+                history.append(df)
+                
+                if show_realtime_3d and frame_counter % update_3d_every_n_frames == 0:
+                    fig = build_3d_figure(df.set_index("index").reset_index())
+                    st.plotly_chart(fig, use_container_width=True, height=400)
 
-        if show_3d:
-            last_df = history[-1]
-            fig = build_3d_figure(last_df.set_index("index"))
-            st.plotly_chart(fig, use_container_width=True, height=480)
-            st.download_button("Download Video 3D HTML",
-                               fig.to_html(full_html=True, include_plotlyjs='cdn'),
-                               "pose_video_3d.html", "text/html")
+            # Annotate frame
+            annotated_frame = frame.copy()
+            if res_pose.pose_landmarks:
+                mp_drawing.draw_landmarks(
+                    annotated_frame,
+                    res_pose.pose_landmarks,
+                    mp_pose.POSE_CONNECTIONS,
+                    landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style()
+                )
+            if show_seg and res_seg and res_seg.segmentation_mask is not None:
+                annotated_frame = apply_segmentation_mask(
+                    annotated_frame, 
+                    res_seg.segmentation_mask, 
+                    seg_threshold=segmentation_conf
+                )
 
-    if save_annotated and annotated_path and os.path.exists(annotated_path):
-        st.success("Annotated video saved.")
-        st.video(annotated_path)
-        with open(annotated_path, "rb") as f:
-            st.download_button("Download Annotated Video",
-                               data=f.read(),
-                               file_name="annotated_pose.mp4",
-                               mime="video/mp4")
+            # Initialize video writer if needed
+            if save_annotated and video_writer is None:
+                h, w = annotated_frame.shape[:2]
+                video_writer = cv2.VideoWriter(
+                    output_path, 
+                    fourcc, 
+                    fps_video if fps_video > 0 else 30.0, 
+                    (w, h))
+            
+            if save_annotated and video_writer is not None:
+                video_writer.write(annotated_frame)
+
+            # Update UI
+            stframe.image(annotated_frame, channels="BGR", caption=f"Frame {frame_counter}")
+            progress_bar.progress(frame_counter / total_frames)
+            elapsed_time = time.time() - start_time
+            status_text.text(f"Processed {frame_counter}/{total_frames} frames | {frame_counter/elapsed_time:.2f} FPS")
+
+        # Cleanup
+        cap.release()
+        pose.close()
+        seg.close()
+        if video_writer is not None:
+            video_writer.release()
+        progress_bar.empty()
+        status_text.empty()
+
+        # Results display
+        if history:
+            full_history = pd.concat(history).reset_index(drop=True)
+            st.subheader(f"Processed Video ({len(history)} frames)")
+            
+            # CSV Download
+            st.download_button(
+                "Download Video Pose CSV",
+                full_history.to_csv(index=False),
+                "pose_video_history.csv",
+                "text/csv"
+            )
+
+            # 3D Visualization
+            if show_3d:
+                last_df = history[-1]
+                fig = build_3d_figure(last_df.set_index("index"))
+                st.plotly_chart(fig, use_container_width=True, height=480)
+                
+                # HTML Download
+                st.download_button(
+                    "Download Video 3D HTML",
+                    fig.to_html(full_html=True, include_plotlyjs='cdn'),
+                    "pose_video_3d.html",
+                    "text/html"
+                )
+
+            # Annotated Video Download
+            if save_annotated and os.path.exists(output_path):
+                st.success("Annotated video saved.")
+                st.video(output_path)
+                with open(output_path, "rb") as f:
+                    st.download_button(
+                        "Download Annotated Video",
+                        data=f.read(),
+                        file_name="annotated_pose.mp4",
+                        mime="video/mp4"
+                    )
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        if save_annotated and os.path.exists(output_path):
+            os.unlink(output_path)
 
 else:
-    # -------------------------
     # Live webcam mode
-    # -------------------------
     webrtc_ctx = webrtc_streamer(
         key="pose-webcam",
-        video_transformer_factory=PoseVideoTransformer,
+        video_processor_factory=PoseVideoProcessor,
         media_stream_constraints={"video": True, "audio": False},
-        async_transform=True
+        async_processing=True
     )
 
-    if webrtc_ctx.video_transformer:
-        tr = webrtc_ctx.video_transformer
-        if tr.latest_df is not None:
+    if webrtc_ctx.video_processor:
+        processor = webrtc_ctx.video_processor
+        if processor.latest_df is not None:
             st.subheader("Latest Frame Landmarks")
-            st.dataframe(tr.latest_df.reset_index(), use_container_width=True)
-            st.download_button("Download Latest Frame CSV",
-                               tr.latest_df.reset_index().to_csv(index=False),
-                               "pose_latest.csv", "text/csv")
+            st.dataframe(processor.latest_df.reset_index(), use_container_width=True)
+            
+            st.download_button(
+                "Download Latest Frame CSV",
+                processor.latest_df.reset_index().to_csv(index=False),
+                "pose_latest.csv",
+                "text/csv"
+            )
 
-            if len(tr.history) > 0:
-                full_history = pd.concat(tr.history).reset_index(drop=True)
-                st.subheader(f"History Buffer ({len(tr.history)} frames)")
-                st.download_button("Download History CSV",
-                                   full_history.to_csv(index=False),
-                                   "pose_history.csv", "text/csv")
+            if len(processor.history) > 0:
+                full_history = pd.concat(processor.history).reset_index(drop=True)
+                st.subheader(f"History Buffer ({len(processor.history)} frames)")
+                
+                st.download_button(
+                    "Download History CSV",
+                    full_history.to_csv(index=False),
+                    "pose_history.csv",
+                    "text/csv"
+                )
 
                 if show_3d:
-                    fig = build_3d_figure(tr.latest_df.reset_index())
+                    fig = build_3d_figure(processor.latest_df.reset_index())
                     st.plotly_chart(fig, use_container_width=True, height=480)
-                    html_str = fig.to_html(full_html=True, include_plotlyjs='cdn')
-                    st.download_button("Download 3D Plot HTML", html_str, "pose_3d_latest.html", "text/html")
+                    
+                    st.download_button(
+                        "Download 3D Plot HTML",
+                        fig.to_html(full_html=True, include_plotlyjs='cdn'),
+                        "pose_3d_latest.html",
+                        "text/html"
+                    )
