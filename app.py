@@ -241,7 +241,17 @@ if video_file:
         frame_placeholder1 = col1.empty()
         frame_placeholder2 = col2.empty()
 
-        while cap.isOpened():
+        # Use session state to prevent reruns
+        if 'stop_processing' not in st.session_state:
+            st.session_state.stop_processing = False
+
+        stop_button = st.button("Stop Processing")
+
+        while cap.isOpened() and not st.session_state.stop_processing:
+            if stop_button:
+                st.session_state.stop_processing = True
+                break
+                
             ret, frame = cap.read()
             if not ret:
                 break
@@ -375,7 +385,10 @@ else:
         key="pose-webcam",
         video_processor_factory=PoseVideoProcessor,
         media_stream_constraints={"video": True, "audio": False},
-        async_processing=True
+        async_processing=True,
+        rtc_configuration={  # Add this for better WebRTC performance
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        }
     )
 
     if webrtc_ctx.video_processor:
