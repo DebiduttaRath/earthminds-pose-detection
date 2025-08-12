@@ -1,4 +1,3 @@
-# estimation_app.py
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer
 import cv2
@@ -106,7 +105,7 @@ def apply_segmentation_mask(frame_bgr, seg_mask, seg_threshold=0.5, alpha=0.7):
     return cv2.addWeighted(frame_bgr, 1.0 - alpha, out, alpha, 0)
 
 # -------------------------
-# Video Processor Class
+# Video Processor Class (Optimized for WebRTC)
 # -------------------------
 class PoseVideoProcessor:
     def __init__(self):
@@ -117,6 +116,8 @@ class PoseVideoProcessor:
         self.history = deque(maxlen=buffer_size)
         self.frame_counter = 0
         self.last_html_update = 0
+        self.last_frame_time = time.time()
+        self.fps = 0
         
     def initialize_models(self):
         self.pose = mp_pose.Pose(
@@ -128,10 +129,17 @@ class PoseVideoProcessor:
         )
         self.seg = mp_selfie.SelfieSegmentation(model_selection=1)
 
+    def calculate_fps(self):
+        now = time.time()
+        self.fps = 1.0 / (now - self.last_frame_time)
+        self.last_frame_time = now
+        return self.fps
+
     def recv(self, frame):
         try:
             img = frame.to_ndarray(format="bgr24")
             self.frame_counter += 1
+            fps = self.calculate_fps()
             
             # Process pose and segmentation
             res_pose = self.pose.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
@@ -166,11 +174,19 @@ class PoseVideoProcessor:
             if show_seg and seg_mask is not None:
                 annotated = apply_segmentation_mask(annotated, seg_mask, seg_threshold=segmentation_conf)
 
-            return annotated
+            # Add FPS text to frames
+            cv2.putText(img, f"Original FPS: {fps:.1f}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(annotated, f"Processed FPS: {fps:.1f}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # Return both original and processed frames
+            return (img, annotated)
             
         except Exception as e:
             print(f"Processing error: {str(e)}")
-            return frame.to_ndarray(format="bgr24")
+            original = frame.to_ndarray(format="bgr24")
+            return (original, original.copy())
 
     def __del__(self):
         if self.pose:
@@ -190,7 +206,7 @@ if video_file:
     try:
         cap = cv2.VideoCapture(temp_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps_video = cap.get(cv2.CAP_PROP_FPS) or 0
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
         pose = mp_pose.Pose(
             static_image_mode=False,
@@ -203,7 +219,6 @@ if video_file:
 
         history = []
         frame_counter = 0
-        stframe = st.empty()
         progress_bar = st.progress(0)
         status_text = st.empty()
         st.markdown(f"**Video Info:** {total_frames} frames @ {fps_video:.1f} FPS")
@@ -218,6 +233,13 @@ if video_file:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
         start_time = time.time()
+        last_frame_time = start_time
+        fps = 0
+
+        # Create placeholders for our frames
+        col1, col2 = st.columns(2)
+        frame_placeholder1 = col1.empty()
+        frame_placeholder2 = col2.empty()
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -225,6 +247,12 @@ if video_file:
                 break
                 
             frame_counter += 1
+            
+            # Calculate FPS
+            now = time.time()
+            fps = 1.0 / (now - last_frame_time)
+            last_frame_time = now
+
             res_pose = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             res_seg = seg.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)) if show_seg else None
 
@@ -253,6 +281,12 @@ if video_file:
                     seg_threshold=segmentation_conf
                 )
 
+            # Add FPS text to frames
+            cv2.putText(frame, f"Original FPS: {fps:.1f}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(annotated_frame, f"Processed FPS: {fps:.1f}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
             # Initialize video writer if needed
             if save_annotated and video_writer is None:
                 h, w = annotated_frame.shape[:2]
@@ -265,8 +299,10 @@ if video_file:
             if save_annotated and video_writer is not None:
                 video_writer.write(annotated_frame)
 
-            # Update UI
-            stframe.image(annotated_frame, channels="BGR", caption=f"Frame {frame_counter}")
+            # Update UI with side-by-side display
+            frame_placeholder1.image(frame, channels="BGR", caption=f"Original Frame {frame_counter}")
+            frame_placeholder2.image(annotated_frame, channels="BGR", caption=f"Processed Frame {frame_counter}")
+            
             progress_bar.progress(frame_counter / total_frames)
             elapsed_time = time.time() - start_time
             status_text.text(f"Processed {frame_counter}/{total_frames} frames | {frame_counter/elapsed_time:.2f} FPS")
@@ -326,6 +362,15 @@ if video_file:
 
 else:
     # Live webcam mode
+    st.subheader("Live Camera Processing")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Original Feed")
+        original_placeholder = st.empty()
+    with col2:
+        st.markdown("### Processed Feed")
+        processed_placeholder = st.empty()
+    
     webrtc_ctx = webrtc_streamer(
         key="pose-webcam",
         video_processor_factory=PoseVideoProcessor,
@@ -335,35 +380,44 @@ else:
 
     if webrtc_ctx.video_processor:
         processor = webrtc_ctx.video_processor
-        if processor.latest_df is not None:
-            st.subheader("Latest Frame Landmarks")
-            st.dataframe(processor.latest_df.reset_index(), use_container_width=True)
+        if webrtc_ctx.video_transformer:
+            # Get both frames from the transformer
+            original_frame, processed_frame = webrtc_ctx.video_transformer
             
-            st.download_button(
-                "Download Latest Frame CSV",
-                processor.latest_df.reset_index().to_csv(index=False),
-                "pose_latest.csv",
-                "text/csv"
-            )
-
-            if len(processor.history) > 0:
-                full_history = pd.concat(processor.history).reset_index(drop=True)
-                st.subheader(f"History Buffer ({len(processor.history)} frames)")
+            # Update the placeholders
+            original_placeholder.image(original_frame, channels="BGR")
+            processed_placeholder.image(processed_frame, channels="BGR")
+            
+            # Display data and controls
+            if processor.latest_df is not None:
+                st.subheader("Latest Frame Landmarks")
+                st.dataframe(processor.latest_df.reset_index(), use_container_width=True)
                 
                 st.download_button(
-                    "Download History CSV",
-                    full_history.to_csv(index=False),
-                    "pose_history.csv",
+                    "Download Latest Frame CSV",
+                    processor.latest_df.reset_index().to_csv(index=False),
+                    "pose_latest.csv",
                     "text/csv"
                 )
 
-                if show_3d:
-                    fig = build_3d_figure(processor.latest_df.reset_index())
-                    st.plotly_chart(fig, use_container_width=True, height=480)
+                if len(processor.history) > 0:
+                    full_history = pd.concat(processor.history).reset_index(drop=True)
+                    st.subheader(f"History Buffer ({len(processor.history)} frames)")
                     
                     st.download_button(
-                        "Download 3D Plot HTML",
-                        fig.to_html(full_html=True, include_plotlyjs='cdn'),
-                        "pose_3d_latest.html",
-                        "text/html"
+                        "Download History CSV",
+                        full_history.to_csv(index=False),
+                        "pose_history.csv",
+                        "text/csv"
                     )
+
+                    if show_3d:
+                        fig = build_3d_figure(processor.latest_df.reset_index())
+                        st.plotly_chart(fig, use_container_width=True, height=480)
+                        
+                        st.download_button(
+                            "Download 3D Plot HTML",
+                            fig.to_html(full_html=True, include_plotlyjs='cdn'),
+                            "pose_3d_latest.html",
+                            "text/html"
+                        )
